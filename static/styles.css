@@ -1,0 +1,52 @@
+/* Custom styles */
+.chat-message {
+    padding: 1rem;
+    border-radius: 0.5rem;
+    margin-bottom: 1rem;
+}
+
+.chat-message.question {
+    background-color: #f3f4f6;
+    margin-right: 2rem;
+}
+
+.chat-message.answer {
+    background-color: #e5e7eb;
+    margin-left: 2rem;
+}
+
+/* Drag and drop styles */
+.drag-over {
+    border-color: #3b82f6 !important;
+    background-color: #eff6ff;
+}
+
+/* Loading animation */
+@keyframes spin {
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+.animate-spin {
+    animation: spin 1s linear infinite;
+}
+
+/* Scrollbar styles */
+#chat-history::-webkit-scrollbar {
+    width: 8px;
+}
+
+#chat-history::-webkit-scrollbar-track {
+    background: #f1f1f1;
+    border-radius: 4px;
+}
+
+#chat-history::-webkit-scrollbar-thumb {
+    background: #888;
+    border-radius: 4px;
+}
+
+#chat-history::-webkit-scrollbar-thumb:hover {
+    background: #555;
+} 
