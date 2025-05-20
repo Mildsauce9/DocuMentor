@@ -1,13 +1,13 @@
 flask==3.0.2
 flask-cors==4.0.0
-openai==1.12.0
 pymupdf==1.23.26
-langchain==0.1.9
-langchain-openai==0.0.8
+langchain==0.3.25
+langchain-openai==0.3.16
+langchain-core == 0.3.59
+langchain-google-genai>=0.0.9
 faiss-cpu==1.7.4
 python-dotenv==1.0.1
 nltk==3.8.1
 spacy==3.7.4
-pandas==2.2.1
-numpy==1.26.4
-gunicorn==21.2.0 
+en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1.tar.gz#egg=en_core_web_sm
+gunicorn==21.2.0

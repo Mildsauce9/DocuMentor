@@ -5,7 +5,8 @@ import os
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
-from langchain_openai import ChatOpenAI
+# Remove ChatOpenAI and import ChatGoogleGenerativeAI
+from langchain_google_genai import ChatGoogleGenerativeAI 
 from langchain.chains import ConversationalRetrievalChain
 from langchain.memory import ConversationBufferMemory
 from langchain.schema import Document
@@ -28,10 +29,10 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 # Download required NLTK data
-nltk.download('punkt')
-nltk.download('averaged_perceptron_tagger')
-nltk.download('maxent_ne_chunker')
-nltk.download('words')
+nltk.download('punkt', quiet=True)
+nltk.download('averaged_perceptron_tagger', quiet=True)
+nltk.download('maxent_ne_chunker', quiet=True)
+nltk.download('words', quiet=True)
 
 # Load spaCy model with error handling
 try:
@@ -53,13 +54,8 @@ def extract_metadata(text, page_num):
     """Extract metadata from text including entities, key concepts, and relationships."""
     doc = nlp(text)
     
-    # Extract named entities
     entities = [ent.text for ent in doc.ents]
-    
-    # Extract key concepts (nouns and noun phrases)
     concepts = [chunk.text for chunk in doc.noun_chunks]
-    
-    # Extract relationships (subject-verb-object patterns)
     relationships = []
     for sent in doc.sents:
         for token in sent:
@@ -70,9 +66,8 @@ def extract_metadata(text, page_num):
                     if child.dep_ in ('dobj', 'pobj'):
                         relationships.append(f"{subject} {verb} {child.text}")
     
-    # Extract dates and numbers
     dates = re.findall(r'\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{4}', text)
-    numbers = re.findall(r'\b\d+\b', text)
+    numbers = re.findall(r'\d+', text)
     
     return {
         'page': page_num,
@@ -83,26 +78,128 @@ def extract_metadata(text, page_num):
         'numbers': numbers
     }
 
+def extract_table_data(page):
+    """Extract tables from a PDF page using PyMuPDF's table detection."""
+    tables = []
+    try:
+        # Get the page's tables
+        tab = page.find_tables()
+        if tab.tables:
+            logger.debug(f"Found {len(tab.tables)} tables on page")
+            for table in tab.tables:
+                table_data = []
+                for row in table.extract():
+                    # Clean and process each cell
+                    processed_row = [cell.strip() if cell else "" for cell in row]
+                    table_data.append(processed_row)
+                
+                # Create a structured representation of the table
+                if table_data:
+                    # Get table position for context
+                    bbox = table.bbox
+                    tables.append({
+                        'data': table_data,
+                        'position': {
+                            'x0': bbox.x0,
+                            'y0': bbox.y0,
+                            'x1': bbox.x1,
+                            'y1': bbox.y1
+                        }
+                    })
+        else:
+            logger.debug("No tables found on page")
+    except Exception as e:
+        logger.warning(f"Error extracting tables: {str(e)}")
+    return tables
+
+def format_table_for_chunking(table_data):
+    """Format table data into a text representation suitable for chunking."""
+    if not table_data['data']:
+        return ""
+    
+    # Get the maximum width of each column
+    col_widths = []
+    for row in table_data['data']:
+        while len(col_widths) < len(row):
+            col_widths.append(0)
+        for i, cell in enumerate(row):
+            col_widths[i] = max(col_widths[i], len(str(cell)))
+    
+    # Format the table as text
+    formatted_rows = []
+    for row in table_data['data']:
+        formatted_cells = []
+        for i, cell in enumerate(row):
+            formatted_cells.append(str(cell).ljust(col_widths[i]))
+        formatted_rows.append(" | ".join(formatted_cells))
+    
+    # Add table context
+    table_text = "Table Content:\n"
+    table_text += "\n".join(formatted_rows)
+    table_text += f"\nTable Position: x0={table_data['position']['x0']}, y0={table_data['position']['y0']}"
+    
+    return table_text
+
 def process_pdf(pdf_file):
     """Process PDF file and return chunks with metadata."""
     tmp_path = None
     try:
-        # Save uploaded file temporarily
         with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
             tmp_path = tmp_file.name
             tmp_file.write(pdf_file.read())
 
-        # Extract text from PDF
         doc = fitz.open(tmp_path)
         chunks_with_metadata = []
+        
+        # Track document structure
+        total_pages = len(doc)
+        chapter_pattern = re.compile(r'^(?:Chapter|CHAPTER)\s+\d+', re.IGNORECASE)
+        current_chapter = "Introduction"
+        chapter_count = 0
+        table_count = 0
+        pages_with_tables = 0
         
         for page_num, page in enumerate(doc):
             text = page.get_text()
             
-            # Split text into sentences for better context
-            sentences = sent_tokenize(text)
+            # Detect chapter headers
+            lines = text.split('\n')
+            for line in lines[:5]:  # Check first few lines for chapter headers
+                if chapter_pattern.match(line.strip()):
+                    current_chapter = line.strip()
+                    chapter_count += 1
+                    break
             
-            # Create chunks with overlapping context
+            # Extract tables from the page
+            tables = extract_table_data(page)
+            if tables:
+                pages_with_tables += 1
+                logger.debug(f"Processing {len(tables)} tables on page {page_num + 1}")
+            
+            for table in tables:
+                table_count += 1
+                table_text = format_table_for_chunking(table)
+                if table_text:
+                    # Create a special chunk for the table
+                    metadata = {
+                        'is_table': True,
+                        'table_number': table_count,
+                        'page': page_num + 1,
+                        'chapter': current_chapter,
+                        'chapter_number': chapter_count,
+                        'total_pages': total_pages,
+                        'is_structural': True,
+                        'page_number': page_num + 1,
+                        'total_chapters': chapter_count,
+                        'table_position': table['position']
+                    }
+                    chunks_with_metadata.append({
+                        'text': table_text,
+                        'metadata': metadata
+                    })
+            
+            # Process regular text content
+            sentences = sent_tokenize(text)
             current_chunk = []
             current_length = 0
             
@@ -110,26 +207,72 @@ def process_pdf(pdf_file):
                 current_chunk.append(sentence)
                 current_length += len(sentence)
                 
-                if current_length >= 1000:  # Chunk size threshold
+                if current_length >= 1000:
                     chunk_text = ' '.join(current_chunk)
                     metadata = extract_metadata(chunk_text, page_num + 1)
-                    
+                    # Add structural metadata
+                    metadata.update({
+                        'chapter': current_chapter,
+                        'chapter_number': chapter_count,
+                        'total_pages': total_pages,
+                        'is_structural': True,
+                        'page_number': page_num + 1,
+                        'total_chapters': chapter_count,
+                        'is_table': False
+                    })
                     chunks_with_metadata.append({
                         'text': chunk_text,
                         'metadata': metadata
                     })
-                    
-                    # Keep last few sentences for context
-                    current_chunk = current_chunk[-3:]  # Keep last 3 sentences
+                    current_chunk = current_chunk[-3:]
                     current_length = sum(len(s) for s in current_chunk)
-        
-        # Close the PDF document
+            
+            # Process any remaining sentences in the last chunk
+            if current_chunk:
+                chunk_text = ' '.join(current_chunk)
+                metadata = extract_metadata(chunk_text, page_num + 1)
+                # Add structural metadata
+                metadata.update({
+                    'chapter': current_chapter,
+                    'chapter_number': chapter_count,
+                    'total_pages': total_pages,
+                    'is_structural': True,
+                    'page_number': page_num + 1,
+                    'total_chapters': chapter_count,
+                    'is_table': False
+                })
+                chunks_with_metadata.append({
+                    'text': chunk_text,
+                    'metadata': metadata
+                })
+
+        # Add a special chunk for document structure
+        structure_text = f"This document has {total_pages} pages and {chapter_count} chapters."
+        if table_count > 0:
+            structure_text += f" It contains {table_count} tables across {pages_with_tables} pages."
+        else:
+            structure_text += " No tables were found in this document."
+            
+        structure_chunk = {
+            'text': structure_text,
+            'metadata': {
+                'is_structural': True,
+                'total_pages': total_pages,
+                'total_chapters': chapter_count,
+                'total_tables': table_count,
+                'pages_with_tables': pages_with_tables,
+                'page': 0,
+                'chapter': 'Document Structure',
+                'is_table': False
+            }
+        }
+        chunks_with_metadata.append(structure_chunk)
+
+        logger.info(f"Document processing complete: {total_pages} pages, {chapter_count} chapters, {table_count} tables")
         doc.close()
-        
         return chunks_with_metadata
     
     finally:
-        # Clean up temporary file
         if tmp_path and os.path.exists(tmp_path):
             try:
                 os.unlink(tmp_path)
@@ -139,59 +282,81 @@ def process_pdf(pdf_file):
 def create_vector_store(chunks_with_metadata):
     """Create vector store from text chunks with metadata."""
     try:
-        # Initialize embeddings with proper configuration
         embeddings = OpenAIEmbeddings(
-            model="text-embedding-3-small",  # Using the latest embedding model
+            model="text-embedding-3-small",
             openai_api_key=os.getenv('OPENAI_API_KEY'),
-            chunk_size=1000  # Add chunk size for better performance
+            chunk_size=1000
         )
         
-        # Create documents with metadata
         documents = []
-        for chunk in chunks_with_metadata:
-            # Combine text with metadata for better semantic search
-            enhanced_text = f"{chunk['text']} {' '.join(chunk['metadata']['concepts'])} {' '.join(chunk['metadata']['entities'])}"
-            # Create a proper Document object
+        for chunk_idx, chunk in enumerate(chunks_with_metadata):
+            # Enhance text with structural information for better retrieval
+            enhanced_text = f"{chunk['text']} "
+            if chunk['metadata'].get('is_structural'):
+                enhanced_text += f"Document structure: {chunk['metadata'].get('chapter', '')} "
+                enhanced_text += f"Page {chunk['metadata'].get('page_number', '')} of {chunk['metadata'].get('total_pages', '')} "
+                enhanced_text += f"Chapter {chunk['metadata'].get('chapter_number', '')} of {chunk['metadata'].get('total_chapters', '')} "
+            if chunk['metadata'].get('is_table'):
+                enhanced_text += f"Table {chunk['metadata'].get('table_number', '')} "
+            enhanced_text += f"{' '.join(chunk['metadata'].get('concepts', []))} {' '.join(chunk['metadata'].get('entities', []))}"
+            
             doc = Document(
                 page_content=enhanced_text,
                 metadata=chunk['metadata']
             )
             documents.append(doc)
         
-        # Create FAISS vector store
-        vector_store = FAISS.from_documents(
+        if not documents:
+            logger.warning("No documents were created from the PDF chunks. Vector store will be empty.")
+            return None
+
+        logger.debug(f"Creating vector store with {len(documents)} documents.")
+        vector_store_instance = FAISS.from_documents(
             documents,
             embeddings
         )
+        logger.debug("FAISS.from_documents call completed.")
         
-        return vector_store
+        return vector_store_instance
     except Exception as e:
         logger.error(f"Error creating vector store: {str(e)}", exc_info=True)
         raise
 
-def setup_conversation_chain(vector_store):
+def setup_conversation_chain(vector_store_instance):
     """Set up the conversation chain with memory and enhanced retrieval."""
-    llm = ChatOpenAI(temperature=0.7)
+    if vector_store_instance is None:
+        logger.error("Vector store is None, cannot set up conversation chain.")
+        raise ValueError("Vector store cannot be None for setting up conversation chain.")
+
+    # Use Gemini model for summarization/conversation
+    llm = ChatGoogleGenerativeAI(
+        model="gemini-2.5-pro-preview-05-06", 
+        temperature=0.7,
+        google_api_key=os.getenv("GOOGLE_API_KEY"),
+        convert_system_message_to_human=True
+    )
+    
     memory = ConversationBufferMemory(
         memory_key="chat_history",
         return_messages=True,
-        output_key="answer"  # Explicitly set which output to store in memory
+        output_key="answer"
     )
     
-    # Create a custom retriever that considers metadata
-    retriever = vector_store.as_retriever(
+    # Enhanced retriever configuration
+    retriever = vector_store_instance.as_retriever(
         search_kwargs={
-            'k': 5,  # Number of chunks to retrieve
-            'fetch_k': 20,  # Number of chunks to fetch before filtering
-            'score_threshold': 0.5  # Minimum similarity score
+            'k': 8,  # Increased number of retrieved documents
+            'fetch_k': 30,  # Increased fetch size
+            'filter': None  # No filtering to ensure structural chunks are included
         }
     )
     
-    # Create the prompt template with proper context formatting
     prompt_template = PromptTemplate(
         template="""You are an AI assistant analyzing a document. Use the following pieces of context to answer the question at the end.
         If you don't know the answer, just say that you don't know. Don't try to make up an answer.
-        Use the metadata and relationships to provide a comprehensive answer that connects different concepts.
+        
+        For questions about document structure (like number of chapters, pages, etc.), pay special attention to chunks marked as structural information.
+        For content questions, use the semantic content and relationships to provide a comprehensive answer.
         
         Context: {context}
         
@@ -204,17 +369,16 @@ def setup_conversation_chain(vector_store):
         input_variables=["context", "chat_history", "question"]
     )
     
-    # Create conversation chain with custom prompt and proper document handling
     conversation_chain = ConversationalRetrievalChain.from_llm(
         llm=llm,
         retriever=retriever,
         memory=memory,
-        return_source_documents=True,  # Return source documents for better context
+        return_source_documents=True,
         combine_docs_chain_kwargs={
             'prompt': prompt_template,
-            'document_variable_name': 'context'  # Explicitly set the document variable name
+            'document_variable_name': 'context'
         },
-        verbose=True  # Enable verbose logging for debugging
+        verbose=True
     )
     
     return conversation_chain
@@ -226,7 +390,7 @@ def serve_index():
 
 @app.route('/upload', methods=['POST'])
 def upload_file():
-    global conversation, vector_store, chat_history
+    global conversation, vector_store, chat_history # Ensure global vector_store is updated
     
     logger.debug("Received file upload request")
     
@@ -241,14 +405,26 @@ def upload_file():
     
     try:
         logger.debug(f"Processing file: {file.filename}")
-        # Process PDF and create vector store
         chunks = process_pdf(file)
         logger.debug(f"Created {len(chunks)} chunks")
         
-        vector_store = create_vector_store(chunks)
-        logger.debug("Created vector store")
+        if not chunks:
+            logger.error("No chunks were created from the PDF.")
+            return jsonify({'error': 'Could not extract text from PDF or PDF is empty.'}), 500
+
+        # Assign to the global vector_store
+        vector_store = create_vector_store(chunks) 
+        test_results = vector_store.similarity_search("What is money ?");
+        print(f"retrieved {len(test_results)} test documents");
+        for doc in test_results:
+            print(doc.page_content[:200])
+        logger.debug("Create vector store call completed.")
+
+        if vector_store is None:
+            logger.error("Failed to create vector store.")
+            return jsonify({'error': 'Failed to create vector store.'}), 500
         
-        conversation = setup_conversation_chain(vector_store)
+        conversation = setup_conversation_chain(vector_store) # Pass the created store
         logger.debug("Set up conversation chain")
         
         chat_history = []
@@ -260,7 +436,7 @@ def upload_file():
 
 @app.route('/ask', methods=['POST'])
 def ask_question():
-    global conversation, chat_history
+    global conversation, chat_history # conversation uses the global vector_store implicitly
     
     logger.debug("Received question request")
     
@@ -274,17 +450,20 @@ def ask_question():
         return jsonify({'error': 'No question provided'}), 400
     
     try:
-        logger.debug(f"Processing question: {data['question']}")
-        # Get response from conversation chain
-        response = conversation({"question": data['question']})
+        question = data['question']
+        logger.debug(f"Processing question: {question}")
         
-        # Store chat history
+        # The conversation chain will use the retriever (which has the vector_store)
+        # to fetch context.
+        response = conversation({"question": question})
+        
         chat_history.append({
-            'question': data['question'],
+            'question': question,
             'answer': response['answer'],
             'sources': [
                 {
-                    'page': doc.metadata['page'],
+                    # Ensure metadata and page number exist
+                    'page': doc.metadata.get('page', 'N/A'), 
                     'content': doc.page_content[:200] + '...'
                 } for doc in response.get('source_documents', [])
             ]
