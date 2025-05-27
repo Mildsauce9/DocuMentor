@@ -36,7 +36,7 @@ OPENAI_API_KEY=your_api_key_here
 
 5. Run the application:
 ```bash
-streamlit run app.py
+python app.py
 ```
 
 ## Usage
