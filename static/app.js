@@ -67,7 +67,8 @@ document.addEventListener('DOMContentLoaded', () => {
             console.log('Sending upload request...');
             const response = await fetch('/upload', {
                 method: 'POST',
-                body: formData
+                body: formData,
+                credentials: 'include'
             });
 
             console.log('Upload response status:', response.status);
@@ -114,7 +115,8 @@ document.addEventListener('DOMContentLoaded', () => {
                 headers: {
                     'Content-Type': 'application/json'
                 },
-                body: JSON.stringify({ question })
+                body: JSON.stringify({ question }),
+                credentials: 'include'
             });
 
             console.log('Question response status:', response.status);

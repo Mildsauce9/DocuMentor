@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, send_from_directory, url_for
+from flask import Flask, request, jsonify, send_from_directory, url_for, session
 from flask_cors import CORS
 import fitz
 import os
@@ -9,7 +9,7 @@ from langchain_community.vectorstores import FAISS
 from langchain_google_genai import ChatGoogleGenerativeAI 
 from langchain.chains import ConversationalRetrievalChain
 from langchain.memory import ConversationBufferMemory
-from langchain.schema import Document
+from langchain.schema import Document, HumanMessage, AIMessage
 from langchain.prompts import PromptTemplate
 import tempfile
 from dotenv import load_dotenv
@@ -20,6 +20,8 @@ from nltk.tokenize import sent_tokenize
 from collections import defaultdict
 import re
 import logging
+import uuid
+import shutil
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)
@@ -29,10 +31,10 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 # Download required NLTK data
-nltk.download('punkt', quiet=True)
-nltk.download('averaged_perceptron_tagger', quiet=True)
-nltk.download('maxent_ne_chunker', quiet=True)
-nltk.download('words', quiet=True)
+# nltk.download('punkt', quiet=True)
+# nltk.download('averaged_perceptron_tagger', quiet=True)
+# nltk.download('maxent_ne_chunker', quiet=True)
+# nltk.download('words', quiet=True)
 
 # Load spaCy model with error handling
 try:
@@ -43,12 +45,14 @@ except OSError:
     nlp = spacy.load('en_core_web_sm')
 
 app = Flask(__name__, static_folder='static', static_url_path='')
-CORS(app)
+CORS(app, supports_credentials=True) # supports_credentials is required for sessions
+# A secret key is required for Flask session management
+app.secret_key = os.urandom(24) 
 
-# Global variables for storing conversation state
-conversation = None
-vector_store = None
-chat_history = []
+# Define the directory to store session-based data
+SESSION_DATA_DIR = "user_sessions"
+if not os.path.exists(SESSION_DATA_DIR):
+    os.makedirs(SESSION_DATA_DIR)
 
 def extract_metadata(text, page_num):
     """Extract metadata from text including entities, key concepts, and relationships."""
@@ -322,8 +326,12 @@ def create_vector_store(chunks_with_metadata):
         logger.error(f"Error creating vector store: {str(e)}", exc_info=True)
         raise
 
-def setup_conversation_chain(vector_store_instance):
-    """Set up the conversation chain with memory and enhanced retrieval."""
+def get_session_dir(session_id):
+    """Constructs the path to the user's session directory."""
+    return os.path.join(SESSION_DATA_DIR, session_id)
+
+def setup_conversation_chain(vector_store_instance, initial_chat_history):
+    """Set up the conversation chain with memory, populated with existing history."""
     if vector_store_instance is None:
         logger.error("Vector store is None, cannot set up conversation chain.")
         raise ValueError("Vector store cannot be None for setting up conversation chain.")
@@ -336,11 +344,18 @@ def setup_conversation_chain(vector_store_instance):
         convert_system_message_to_human=True
     )
     
+    # The memory object is now created with the user's specific chat history.
+    # When a user asks a question, we load their past conversation from a file
+    # and populate this memory object, giving the AI context of their prior interaction.
     memory = ConversationBufferMemory(
         memory_key="chat_history",
         return_messages=True,
         output_key="answer"
     )
+    # Populate memory with past messages
+    for message in initial_chat_history:
+        memory.chat_memory.messages.append(HumanMessage(content=message['question']))
+        memory.chat_memory.messages.append(AIMessage(content=message['answer']))
     
     # Enhanced retriever configuration
     retriever = vector_store_instance.as_retriever(
@@ -353,7 +368,7 @@ def setup_conversation_chain(vector_store_instance):
     
     prompt_template = PromptTemplate(
         template="""You are an AI assistant analyzing a document. Use the following pieces of context to answer the question at the end.
-        If you don't know the answer, just say that you don't know. Don't try to make up an answer.
+        If you are unable to find an answer in the constext, express that the answer is not available in the document. Don't try to make up an answer.
         
         For questions about document structure (like number of chapters, pages, etc.), pay special attention to chunks marked as structural information.
         For content questions, use the semantic content and relationships to provide a comprehensive answer.
@@ -390,8 +405,18 @@ def serve_index():
 
 @app.route('/upload', methods=['POST'])
 def upload_file():
-    global conversation, vector_store, chat_history # Ensure global vector_store is updated
+    # --- THEORY & REASONING ---
+    # This endpoint now initiates a user session.
+    # 1. A unique session ID is generated.
+    # 2. A directory is created on the server using this ID.
+    # 3. The processed PDF (as a vector store) is saved to this directory.
+    # 4. The session ID is stored in a browser cookie to identify the user on subsequent requests.
     
+    # Clean up old session data if a new file is uploaded in the same browser session
+    if 'session_id' in session and os.path.exists(get_session_dir(session['session_id'])):
+        logger.debug(f"Removing old session data for {session['session_id']}")
+        shutil.rmtree(get_session_dir(session['session_id']))
+
     logger.debug("Received file upload request")
     
     if 'file' not in request.files:
@@ -404,7 +429,12 @@ def upload_file():
         return jsonify({'error': 'No file selected'}), 400
     
     try:
-        logger.debug(f"Processing file: {file.filename}")
+        session_id = str(uuid.uuid4())
+        session['session_id'] = session_id
+        session_dir = get_session_dir(session_id)
+        os.makedirs(session_dir)
+
+        logger.debug(f"Processing file: {file.filename} for session: {session_id}")
         chunks = process_pdf(file)
         logger.debug(f"Created {len(chunks)} chunks")
         
@@ -412,38 +442,50 @@ def upload_file():
             logger.error("No chunks were created from the PDF.")
             return jsonify({'error': 'Could not extract text from PDF or PDF is empty.'}), 500
 
-        # Assign to the global vector_store
-        vector_store = create_vector_store(chunks) 
-        test_results = vector_store.similarity_search("What is money ?");
-        print(f"retrieved {len(test_results)} test documents");
-        for doc in test_results:
-            print(doc.page_content[:200])
-        logger.debug("Create vector store call completed.")
-
+        vector_store = create_vector_store(chunks)
         if vector_store is None:
             logger.error("Failed to create vector store.")
             return jsonify({'error': 'Failed to create vector store.'}), 500
         
-        conversation = setup_conversation_chain(vector_store) # Pass the created store
-        logger.debug("Set up conversation chain")
+        # Save the vector store to the user's session directory
+        index_path = os.path.join(session_dir, 'faiss_index')
+        vector_store.save_local(index_path)
+        logger.debug(f"Vector store saved to {index_path}")
+
+        # Initialize and save an empty chat history for the new session
+        chat_history_path = os.path.join(session_dir, 'chat_history.json')
+        with open(chat_history_path, 'w') as f:
+            json.dump([], f)
         
-        chat_history = []
-        
-        return jsonify({'message': 'PDF processed successfully'}), 200
+        return jsonify({'message': 'PDF processed successfully. Session started.'}), 200
     except Exception as e:
         logger.error(f"Error processing file: {str(e)}", exc_info=True)
         return jsonify({'error': str(e)}), 500
 
 @app.route('/ask', methods=['POST'])
 def ask_question():
-    global conversation, chat_history # conversation uses the global vector_store implicitly
+    # --- THEORY & REASONING ---
+    # This endpoint now operates within a user's session.
+    # 1. It retrieves the session ID from the browser cookie.
+    # 2. It loads the user-specific vector store and chat history from their session directory.
+    # 3. It runs the conversation, saves the updated history, and returns the answer.
+    # If no session ID is found, it means the user hasn't uploaded a document yet.
     
     logger.debug("Received question request")
+
+    if 'session_id' not in session:
+        logger.error("No session_id found in session")
+        return jsonify({'error': 'Please upload a PDF first to start a session.'}), 400
+
+    session_id = session['session_id']
+    session_dir = get_session_dir(session_id)
+    index_path = os.path.join(session_dir, 'faiss_index')
+    chat_history_path = os.path.join(session_dir, 'chat_history.json')
     
-    if not conversation:
-        logger.error("No conversation initialized")
-        return jsonify({'error': 'Please upload a PDF first'}), 400
-    
+    if not os.path.exists(index_path) or not os.path.exists(chat_history_path):
+        logger.error(f"Session data not found for session_id: {session_id}")
+        return jsonify({'error': 'Your session has expired or data is missing. Please upload the PDF again.'}), 400
+
     data = request.get_json()
     if not data or 'question' not in data:
         logger.error("No question in request")
@@ -451,23 +493,40 @@ def ask_question():
     
     try:
         question = data['question']
-        logger.debug(f"Processing question: {question}")
+        logger.debug(f"Processing question: {question} for session: {session_id}")
         
-        # The conversation chain will use the retriever (which has the vector_store)
-        # to fetch context.
+        # Load the user's specific vector store
+        embeddings = OpenAIEmbeddings(
+            model="text-embedding-3-small",
+            openai_api_key=os.getenv('OPENAI_API_KEY'),
+            chunk_size=1000
+        )
+        vector_store = FAISS.load_local(index_path, embeddings, allow_dangerous_deserialization=True)
+        
+        # Load the user's chat history
+        with open(chat_history_path, 'r') as f:
+            chat_history = json.load(f)
+            
+        # Set up the conversation chain with the user's data and history
+        conversation = setup_conversation_chain(vector_store, chat_history)
+        
         response = conversation({"question": question})
         
+        # Append new interaction to the history list
         chat_history.append({
             'question': question,
             'answer': response['answer'],
             'sources': [
                 {
-                    # Ensure metadata and page number exist
                     'page': doc.metadata.get('page', 'N/A'), 
                     'content': doc.page_content[:200] + '...'
                 } for doc in response.get('source_documents', [])
             ]
         })
+        
+        # Save the updated chat history back to the file
+        with open(chat_history_path, 'w') as f:
+            json.dump(chat_history, f)
         
         logger.debug("Generated response successfully")
         return jsonify({
